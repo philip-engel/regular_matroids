@@ -1,4 +1,4 @@
-// Code for computing spaces of symmetrized solutions mod p.
+// MAGMA code for computing spaces of symmetrized solutions mod p.
 // Averaged solutions for the graphic matroid of the complete graph K_{2n+1}.
 // Supporting code for "OPTIMALITY OF THE PRYM–TYURIN CONSTRUCTION FOR A6"
 // Notes: (1) We use n here, vs 2n+1 in the paper; (2) solution matrix is transposed.
