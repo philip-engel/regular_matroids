@@ -1,0 +1,648 @@
+// Magma code for computing spaces of symmetrized solutions mod p.
+// Averaged solutions for the graphic matroid of the complete graph K_{2n+1}.
+// Supporting code for "OPTIMALITY OF THE PRYM–TYURIN CONSTRUCTION FOR A6"
+// Notes: (1) We use n here, vs 2n+1 in the paper; (2) solution matrix is transposed.
+// Authored by Philip Engel, Olivier de Gaay Fortman, and Stefan Schreieder
+// Last edited: Monday, December 1, 2025
+
+//////////////////////////
+// Encoding of Group Actions on K_{2n+1}
+//////////////////////////
+function StepBlockDecode(color,n)
+    s := (color div n) + 1;
+    i := color mod n;
+    return s,i,s-1;
+end function;
+
+function StepBlockEncode(s,i,n) return (s-1)*n + i; end function;
+function IsRotationIdx(idx) return (idx mod 2) eq 1; end function;
+
+function _IdxToTypeK(idx,n)
+    if (idx mod 2) eq 1 then return "R",(idx-1) div 2; else return "S",(idx-2) div 2; end if;
+end function;
+
+function _TypeKToIdx(T,k,n)
+    k := k mod n;
+    if T eq "R" then return 2*k+1; else return 2*k+2; end if;
+end function;
+
+function ComposeIdx(idx2,idx1,n)
+    T2,k2 := _IdxToTypeK(idx2,n);
+    T1,k1 := _IdxToTypeK(idx1,n);
+    if    T2 eq "R" and T1 eq "R" then return _TypeKToIdx("R",k2+k1,n);
+    elif  T2 eq "R" and T1 eq "S" then return _TypeKToIdx("S",k2+k1,n);
+    elif  T2 eq "S" and T1 eq "R" then return _TypeKToIdx("S",k2-k1,n);
+    else                               return _TypeKToIdx("R",k2-k1,n);
+    end if;
+end function;
+
+function ComposeElems(e2,e1,n) return < ComposeIdx(e2[1],e1[1],n), e2[2]*e1[2] >; end function;
+function ActionSign(idx,eps) return (IsRotationIdx(idx) select 1 else -1)*eps; end function;
+
+function DihedralVertexPerms(n)
+    perms := [];
+    for k in [0..n-1] do
+        Append(~perms,[ (i+k) mod n : i in [0..n-1] ]);
+        Append(~perms,[ (k-i) mod n : i in [0..n-1] ]);
+    end for;
+    return perms;
+end function;
+
+//////////////////////////
+// Subgroups (for averagings solutions)
+//////////////////////////
+function BuildSubgroup(name,n : include_negation:=false)
+    if name eq "DnZ2" then
+        L := [* *];
+        for idx in [1..2*n] do Append(~L,<idx, 1>); Append(~L,<idx,-1>); end for;
+        return L;
+    elif name eq "Dn" then
+        L := [* *];
+        for idx in [1..2*n] do Append(~L,<idx, 1>); end for;
+        return L;
+    elif name eq "Cn" then
+        L := [* *];
+        for k in [0..n-1] do Append(~L,<2*k+1,1>); end for;
+        return L;
+    elif name eq "CnZ2" then
+        L := [* *];
+        for k in [0..n-1] do Append(~L,<2*k+1, 1>); Append(~L,<2*k+1,-1>); end for;
+        return L;
+    elif name eq "Z2" then
+        return [ <1,1>, <1,-1> ];
+    elif name eq "Triv" then
+        return [ <1,1> ];
+    else
+        error Sprintf("Unknown subgroup '%o'.",name);
+    end if;
+end function;
+
+// Convenience
+function SubgroupSize(name,n) return #BuildSubgroup(name,n); end function;
+
+//////////////////////////
+// Re-express edge duals e_i^* for i in the inner most star (i.e. step-n edges),
+// in terms of the step-star basis. These expressions are encoded
+// as a matrix, in BuildStarReductionMatrixFromCycles.
+//////////////////////////
+function BuildStarReductionMatrixFromCycles(p,n)
+    F := GF(p);
+    M := (n-1) div 2;
+    numCycles := (n-1)*(n-2) div 2;
+    idxSmall := func< s,i | (s-1)*n + (i+1) >;
+    function StepColorSign(u,v)
+        d := ((v-u) mod n);
+        if 1 le d and d le M then return d,u,1; else return ((u-v) mod n),v,-1; end if;
+    end function;
+
+    smallRows := [ [ Integers() | 0 : k in [1..(M-1)*n] ] : r in [1..numCycles] ];
+    starSum   := [ Integers() | 0 : r in [1..numCycles] ];
+    starCols  := [ [ Integers() | 0 : i in [1..n] ] : r in [1..numCycles] ];
+
+    r := 0;
+    for u in [1..n-2] do
+        for v in [u+1..n-1] do
+            r +:= 1;
+            for t in [<u,0>,<0,v>,<v,u>] do
+                s,i,sg := StepColorSign(t[1],t[2]);
+                if s lt M then smallRows[r][idxSmall(s,i)] +:= sg;
+                else starSum[r] +:= sg; starCols[r][i+1] +:= sg; end if;
+            end for;
+        end for;
+    end for;
+
+    Bsm := Matrix(F, numCycles, (M-1)*n,
+                  &cat[[ F!(smallRows[r][k] mod p) : k in [1..(M-1)*n] ] : r in [1..numCycles] ]);
+    Ssum := Matrix(F, numCycles, 1, [ F!(starSum[r] mod p) : r in [1..numCycles] ]);
+    Scol := Matrix(F, numCycles, n, &cat[[ F!(starCols[r][i] mod p) : i in [1..n] ] : r in [1..numCycles] ]);
+
+    X := (HorizontalJoin(Bsm,Ssum)^-1) * Scol;
+    return Transpose(X);
+end function;
+
+//////////////////////////
+// Construct basis of B^1(K_{2n+1}, F_p)
+//////////////////////////
+function CohomMapMatrix(n,p : Gp:=false)
+    if Gp cmpeq false then Gp := BuildStarReductionMatrixFromCycles(p,n); end if;
+    M := (n-1) div 2; m := M*n; d := (M-1)*n+1;
+    Phi := ZeroMatrix(GF(p), d, m);
+    for s in [1..M-1] do
+        for i in [0..n-1] do
+            Phi[(s-1)*n+(i+1), StepBlockEncode(s,i,n)+1] := GF(p)!1;
+        end for;
+    end for;
+    for i in [0..n-1] do
+        col := StepBlockEncode(M,i,n)+1;
+        row_idx := i+1; // FIX: i+1
+        for k in [1..d] do
+            Phi[k,col] := Gp[row_idx,k];
+        end for;
+    end for;
+    return Phi;
+end function;
+
+function MakeColorVectors(n)
+    M := (n-1) div 2; m := M*n; cvs := [];
+    for r in [0..n-2] do
+        v := [ Integers() | 0 : k in [1..m] ];
+        for s in [1..M] do
+            off := (s-1)*n;
+            v[off+r+1] +:= 1;
+            v[off+((r-s) mod n)+1] -:= 1;
+        end for;
+        Append(~cvs,v);
+    end for;
+    return cvs;
+end function;
+
+function KernelColorVectors(n,p : Gp:=false)
+    if Gp cmpeq false then Gp := BuildStarReductionMatrixFromCycles(p,n); end if;
+    Phi := CohomMapMatrix(n,p : Gp:=Gp);
+    U := Nullspace(Phi); K := [];
+    for v in Basis(U) do
+        Append(~K,[ Integers()!(Eltseq(v)[c]) : c in [1..#Eltseq(v)] ]);
+    end for;
+    if #K eq 0 then K := MakeColorVectors(n); end if;
+    return K;
+end function;
+
+//////////////////////////
+// Group actions on colors / vertices
+//////////////////////////
+function MapColorUnderPerm(color,perm,n)
+    s,i,_ := StepBlockDecode(color,n);
+    u := perm[i+1]; v := perm[((i+s) mod n)+1]; d := (v-u) mod n;
+    if d eq s then return StepBlockEncode(s,u,n),1;
+    elif d eq ((n-s) mod n) then return StepBlockEncode(s,v,n),-1;
+    else return StepBlockEncode(s,u,n),1; end if;
+end function;
+
+function ApplyElemStep(vec,idx,eps,p,s,n,perms)
+    perm := perms[idx]; out := [ Integers()!0 : k in [1..n] ];
+    for i in [0..n-1] do
+        u := perm[i+1]; v := perm[((i+s) mod n)+1]; d := (v-u) mod n;
+        if d eq s then out[u+1] := (out[u+1] + vec[i+1]) mod p;
+        elif d eq ((n-s) mod n) then out[v+1] := (out[v+1] - vec[i+1]) mod p;
+        else out[u+1] := (out[u+1] + vec[i+1]) mod p; end if;
+    end for;
+    if eps eq -1 then for k in [1..n] do out[k] := (-out[k]) mod p; end for; end if;
+    return out;
+end function;
+
+function ApplyElemStar(c,idx,eps,p)
+    geom := IsRotationIdx(idx) select 1 else -1;
+    return (geom*eps*(c mod p)) mod p;
+end function;
+
+function ActOnVertex(vertex,idx,eps,p,n,perms)
+    blocks := vertex[1]; M := (n-1) div 2; nb := [];
+    for s in [1..M-1] do Append(~nb,ApplyElemStep(blocks[s],idx,eps,p,s,n,perms)); end for;
+    return < nb, ApplyElemStar(vertex[2],idx,eps,p) >;
+end function;
+
+//////////////////////////
+// Find lexicographic fundamental domain V_{fund} for a given averaging group
+// and computes the stabilizer subgroup of that fundamental domain vertex
+//////////////////////////
+function FindMinimizingElemForStep(vec,subgroup,s,n,p,perms)
+    bestVec := vec; best := <1,1>; first := true;
+    for e in subgroup do
+        w := ApplyElemStep(vec,e[1],e[2],p,s,n,perms);
+        if first or (w lt bestVec) or ((w eq bestVec) and <e[1],-e[2]> lt <best[1],-best[2]>) then
+            bestVec := w; best := e; first := false;
+        end if;
+    end for;
+    return best,bestVec;
+end function;
+
+function ElementToFundamentalDomain(vertex,n,p,perms : group:=false)
+    M := (n-1) div 2;
+    subgroup := (group cmpeq false) select BuildSubgroup("DnZ2",n) else group;
+    e_total := <1,1>; v := vertex;
+    for s in [1..M-1] do
+        e_s,_ := FindMinimizingElemForStep(v[1][s],subgroup,s,n,p,perms);
+        v := ActOnVertex(v,e_s[1],e_s[2],p,n,perms);
+        L := [];
+        for e in subgroup do
+            if ApplyElemStep(v[1][s],e[1],e[2],p,s,n,perms) eq v[1][s] then Append(~L,e); end if;
+        end for;
+        subgroup := L;
+        e_total := ComposeElems(e_s,e_total,n);
+    end for;
+    hasNeg := false; for e in subgroup do if ActionSign(e[1],e[2]) eq -1 then hasNeg := true; break; end if; end for;
+    if hasNeg and (p mod 2 eq 1) then
+        c0 := v[2] mod p;
+        if ((-c0) mod p) lt c0 then
+            e_neg := subgroup[1];
+            for e in subgroup do if ActionSign(e[1],e[2]) eq -1 then e_neg := e; break; end if; end for;
+            v := ActOnVertex(v,e_neg[1],e_neg[2],p,n,perms);
+            e_total := ComposeElems(e_neg,e_total,n);
+        end if;
+    end if;
+    return e_total,v;
+end function;
+
+function StepStabilizer(vec,p,s,n,subgroup,perms)
+    S := [];
+    for e in subgroup do if ApplyElemStep(vec,e[1],e[2],p,s,n,perms) eq vec then Append(~S,e); end if; end for;
+    return S;
+end function;
+
+function AllStepRepsWithStabilizers(n,p,subgroup,s,perms)
+    pairs := []; seen := AssociativeArray(Strings());
+    v := [ Integers() | 0 : i in [1..n] ]; done := false;
+    while not done do
+        key := Sprint(v);
+        if not IsDefined(seen,key) then
+            orb := [ ApplyElemStep(v,e[1],e[2],p,s,n,perms) : e in subgroup ];
+            rep := orb[1]; for w in orb do if w lt rep then rep := w; end if; end for;
+            stab := StepStabilizer(rep,p,s,n,subgroup,perms);
+            Append(~pairs, <rep,stab>); for w in orb do seen[Sprint(w)] := true; end for;
+        end if;
+        pos := n;
+        while true do
+            if v[pos] lt p-1 then v[pos] +:= 1; for k in [pos+1..n] do v[k] := 0; end for; break;
+            elif pos eq 1 then done := true; break;
+            else pos -:= 1; end if;
+        end while;
+    end while;
+    return pairs;
+end function;
+
+function AllStarRepsWithStabilizers(p,subgroup,n)
+    pairs := []; seen := AssociativeArray(Strings());
+    for c in [0..p-1] do
+        key := IntegerToString(c);
+        if not IsDefined(seen,key) then
+            orb := [ ApplyElemStar(c,e[1],e[2],p) : e in subgroup ];
+            rep := orb[1]; for w in orb do if w lt rep then rep := w; end if; end for;
+            stab := [ e : e in subgroup | ApplyElemStar(rep,e[1],e[2],p) eq rep ];
+            Append(~pairs, <rep,stab>); for w in orb do seen[IntegerToString(w)] := true; end for;
+        end if;
+    end for;
+    return pairs;
+end function;
+
+function AlbVertexRepresentatives(n,p,perms : group:=false)
+    M := (n-1) div 2;
+    full := (group cmpeq false) select BuildSubgroup("DnZ2",n) else group;
+    if M eq 1 then
+        if p mod 3 eq 0 then error Sprintf("Need p != 3 for n=3; got %o.",p); end if;
+        starPairs := AllStarRepsWithStabilizers(p,full,n);
+        reps := []; for R in starPairs do Append(~reps, < [], R[1], R[2] >); end for; return reps;
+    end if;
+    reps_s1 := AllStepRepsWithStabilizers(n,p,full,1,perms);
+    numCaches := Max(M-2,0);
+    caches := [* AssociativeArray(Strings()) : k in [1..numCaches] *];
+    starCache := AssociativeArray(Strings());
+    function KeyGroup(H) L := [ <e[1],e[2]> : e in H ]; Sort(~L); return Sprint(L); end function;
+
+    reps := [];
+    for P in reps_s1 do
+        a1 := P[1]; H1 := P[2]; prev := [* < [* *], H1 > *];
+        for s in [2..M-1] do
+            next := [* *]; cache := caches[s-1];
+            for q in prev do
+                prefix := q[1]; Hprev := q[2]; key := KeyGroup(Hprev);
+                if not IsDefined(cache,key) then cache[key] := AllStepRepsWithStabilizers(n,p,Hprev,s,perms); end if;
+                for R in cache[key] do Append(~next, < prefix cat [* R[1] *], R[2] >); end for;
+            end for;
+            caches[s-1] := cache; prev := next;
+        end for;
+        H_last_list := (M eq 2) select [* < [* *], H1 > *] else prev;
+        for q in H_last_list do
+            prefix := q[1]; Hlast := q[2]; key := KeyGroup(Hlast);
+            if not IsDefined(starCache,key) then starCache[key] := AllStarRepsWithStabilizers(p,Hlast,n); end if;
+            for R in starCache[key] do
+                c := R[1]; Hfinal := R[2];
+                blocks := [ a1 ] cat [ prefix[i] : i in [1..#prefix] ];
+                Append(~reps, < blocks, c, Hfinal >);
+            end for;
+        end for;
+    end for;
+    return reps;
+end function;
+
+//////////////////////////
+// Computes endpoints of edges of Alb, given a starting
+// vertex and a color (i.e. edge of K_{2n+1}). Relies on
+// BuildStarReductionMatrixFromCycles
+//////////////////////////
+function AlbEdgeEndpointWithGp(vertex,color,p,n,Gp)
+    M := (n-1) div 2;
+    blocks := [ [ Integers()!x : x in seq ] : seq in vertex[1] ];
+    c := vertex[2] mod p;
+    s,i,_ := StepBlockDecode(color,n);
+    if s lt M then
+        blocks[s][i+1] := (blocks[s][i+1] + 1) mod p;
+    else
+        row_idx := i+1;
+        row := [ Integers()!(Eltseq(Gp[row_idx,k])[1]) : k in [1..((M-1)*n+1)] ];
+        off := 0;
+        for ss in [1..M-1] do
+            for k in [1..n] do blocks[ss][k] := (blocks[ss][k] + row[off+k]) mod p; end for;
+            off +:= n;
+        end for;
+        c := (c + row[off+1]) mod p;
+    end if;
+    return <blocks,c>, color;
+end function;
+
+function AlbEdgeMove(vertex,color,sign,p,n,Gp)
+    M := (n-1) div 2;
+    blocks := [ [ Integers()!x : x in seq ] : seq in vertex[1] ];
+    c := vertex[2] mod p;
+    s,i,_ := StepBlockDecode(color,n);
+    scal := (sign eq 1) select 1 else (p-1);
+    if s lt M then
+        blocks[s][i+1] := (blocks[s][i+1] + scal) mod p;
+    else
+        row_idx := i+1;
+        row := [ Integers()!(Eltseq(Gp[row_idx,k])[1]) : k in [1..((M-1)*n+1)] ];
+        off := 0;
+        for ss in [1..M-1] do
+            for k in [1..n] do blocks[ss][k] := (blocks[ss][k] + scal*row[off+k]) mod p; end for;
+            off +:= n;
+        end for;
+        c := (c + scal*row[off+1]) mod p;
+    end if;
+    return <blocks,c>, color;
+end function;
+
+//////////////////////////
+// Underlying permutation of edges of K_{2n+1} without signs
+//////////////////////////
+function BuildColorImageTable(n,perms)
+    M := (n-1) div 2; m := M*n;
+    NC := ZeroMatrix(Integers(),2*n,m);
+    for idx in [1..2*n] do
+        perm := perms[idx];
+        for color in [0..m-1] do
+            newc,_ := MapColorUnderPerm(color,perm,n);
+            NC[idx,color+1] := newc;
+        end for;
+    end for;
+    return NC;
+end function;
+
+//////////////////////////
+// Collects the necessary data to build
+// color weighted boundaries of symmetrized 1-chains, in particular:
+// Given an edge entering or exiting a vertex in the fundamental domain,
+// we take its symmetrization. This contributes various color boundary components
+// to the original vertex, and to the reduction of the second vertex into
+// the fundamental domain. The stabilizer subgroup at the incoming or outgoing vertex
+// produces, in general, multiple edges incident upon that vertex, all of which
+// can contribute to a color weighted boundary.
+//////////////////////////
+function BuildRepData(n,p : subgroup:="DnZ2")
+    perms := DihedralVertexPerms(n);
+    Gp := BuildStarReductionMatrixFromCycles(p,n);
+    H := BuildSubgroup(subgroup,n);
+    reps := AlbVertexRepresentatives(n,p,perms : group:=H);
+    R := #reps;
+
+    verts := [* <reps[j][1],reps[j][2]> : j in [1..R] *];
+    repIndex := AssociativeArray(Strings());
+    for j in [1..R] do
+        repIndex[Sprint(verts[j])] := j;
+    end for;
+
+    M := (n-1) div 2; m := M*n;
+
+    incoming_plus := [];
+    for j in [1..R] do
+        base := verts[j]; row := [];
+        for color in [0..m-1] do
+            end_vertex,_ := AlbEdgeEndpointWithGp(base,color,p,n,Gp);
+            e_tot,vFD := ElementToFundamentalDomain(end_vertex,n,p,perms : group:=H);
+            dest_j := repIndex[Sprint(vFD)];
+            mappedColor,_ := MapColorUnderPerm(color,perms[e_tot[1]],n);
+            sigma := ActionSign(e_tot[1],e_tot[2]);
+            Append(~row, <dest_j,mappedColor,sigma>);
+        end for;
+        Append(~incoming_plus,row);
+    end for;
+
+    incoming_minus := [];
+    for j in [1..R] do
+        base := verts[j]; row := [];
+        for color in [0..m-1] do
+            v_start,_ := AlbEdgeMove(base,color,-1,p,n,Gp);
+            e_tot,vFD := ElementToFundamentalDomain(v_start,n,p,perms : group:=H);
+            dest_j := repIndex[Sprint(vFD)];
+            mapped,_ := MapColorUnderPerm(color,perms[e_tot[1]],n);
+            sigma := ActionSign(e_tot[1],e_tot[2]);
+            Append(~row, <dest_j,mapped,sigma>);
+        end for;
+        Append(~incoming_minus,row);
+    end for;
+
+    NC := BuildColorImageTable(n,perms);
+    return <perms,Gp,reps,verts,repIndex,incoming_plus,NC,incoming_minus>;
+end function;
+
+//////////////////////////
+// Builds one stack of the averaged solution matrix,
+// for a given color weighting vector.
+//////////////////////////
+function BuildSymBoundaryMatrix_FromColorVectors(p,n,cvs : subgroup:="DnZ2", data:=false)
+    if data cmpeq false then data := BuildRepData(n,p : subgroup:=subgroup); end if;
+
+    reps := data[3];
+    incoming_plus  := data[6];
+    NC := data[7];
+    incoming_minus := data[8];
+
+    R := #reps; M := (n-1) div 2; m := M*n; B := #cvs;
+    total_rows := 2*m*R; total_cols := R*B; entries := [];
+
+    repIndex := AssociativeArray(Strings());
+    for j in [1..R] do repIndex[Sprint(<reps[j][1],reps[j][2]>) ] := j; end for;
+
+    // OUTOUT vectors per (rep,color)
+    Vout := [* *];
+    for j in [1..R] do
+        Hstab := reps[j][3];
+        Vi := [* *];
+        for i in [1..m] do
+            v := [ Integers() | 0 : t in [1..m] ];
+            for e in Hstab do
+                idx := e[1]; eps := e[2];
+                k := NC[idx,i];
+                v[k+1] +:= -ActionSign(idx,eps);
+            end for;
+            Append(~Vi,v);
+        end for;
+        Append(~Vout,Vi);
+    end for;
+
+    function DotMod(vec,cv,p)
+        s := 0; for t in [1..#vec] do if vec[t] ne 0 then s +:= vec[t]*(cv[t] mod p); end if; end for;
+        return s mod p;
+    end function;
+
+    for b in [1..B] do
+        cv := [ Integers() | (cvs[b][k] mod p) : k in [1..m] ];
+        colbase := (b-1)*R;
+
+        for j in [1..R] do
+            incp := incoming_plus[j];
+            incm := incoming_minus[j];
+
+            for i in [1..m] do
+                row_out := (j-1)*(2*m) + (2*(i-1) + 1);
+                row_in  := row_out + 1;
+
+                // OUTOUT
+                outout_vec := Vout[j][i];
+                outout_val := DotMod(outout_vec, cv, p);
+
+                // OUTIN
+                dest_p   := incp[i][1];
+                mapped_p := incp[i][2] + 1;
+                sigma_p  := incp[i][3];
+                base_outin_vec := Vout[dest_p][mapped_p];
+                outin_vec := (sigma_p eq 1) select [ Integers() | (-x) : x in base_outin_vec ] else base_outin_vec;
+                outin_val := DotMod(outin_vec, cv, p);
+
+                c1 := colbase + j;
+                c2 := colbase + dest_p;
+                if c1 eq c2 then
+                    v := (outout_val + outin_val) mod p;
+                    if v ne 0 then Append(~entries, < row_out, c1, GF(p)!v >); end if;
+                else
+                    if outout_val ne 0 then Append(~entries, < row_out, c1, GF(p)!outout_val >); end if;
+                    if outin_val  ne 0 then Append(~entries, < row_out, c2, GF(p)!outin_val  >); end if;
+                end if;
+
+                // ININ = −OUTOUT
+                inin_vec := [ Integers() | (-x) : x in outout_vec ];
+                inin_val := DotMod(inin_vec, cv, p);
+
+                // INOUT
+                dest_m   := incm[i][1];
+                mapped_m := incm[i][2] + 1;
+                sigma_m  := incm[i][3];
+                base_inout_vec := Vout[dest_m][mapped_m];
+                inout_vec := (sigma_m eq -1) select [ Integers() | (-x) : x in base_inout_vec ] else base_inout_vec;
+                inout_val := DotMod(inout_vec, cv, p);
+
+                c3 := colbase + j;
+                c4 := colbase + dest_m;
+                if c3 eq c4 then
+                    v := (inin_val + inout_val) mod p;
+                    if v ne 0 then Append(~entries, < row_in, c3, GF(p)!v >); end if;
+                else
+                    if inin_val  ne 0 then Append(~entries, < row_in, c3, GF(p)!inin_val  >); end if;
+                    if inout_val ne 0 then Append(~entries, < row_in, c4, GF(p)!inout_val >); end if;
+                end if;
+            end for;
+        end for;
+    end for;
+
+    A := SparseMatrix(GF(p), total_rows, total_cols, entries);
+    return A, reps, repIndex;
+end function;
+
+//////////////////////////
+// Adds color profile constraints
+// for edges; if group acts transitively on step-k edges
+// adds a column for each step. If not, adds a column
+// for each edge.
+//////////////////////////
+function ColorProfileColumnsSteps_TwoRow(p,n,reps,steps)
+    M := (n-1) div 2; m := M*n; R := #reps;
+    good := []; for s in steps do if 1 le s and s le M then Append(~good,s); end if; end for;
+    if #good eq 0 then return SparseMatrix(GF(p),2*m*R,0,[]); end if;
+
+    entries := [];
+    for j in [1..R] do
+        base := (j-1)*(2*m);
+        for t in [1..#good] do
+            s := good[t];
+            for i in [0..n-1] do
+                c := StepBlockEncode(s,i,n);
+                Append(~entries, < base + (2*c + 1), t, GF(p)!1 >); // OUT
+                Append(~entries, < base + (2*c + 2), t, GF(p)!1 >); // IN
+            end for;
+        end for;
+    end for;
+    return SparseMatrix(GF(p), 2*m*R, #good, entries);
+end function;
+
+function ColorProfileColumnsSteps_TwoRow_ByColor(p,n,reps,steps)
+    M := (n-1) div 2; m := M*n; R := #reps;
+    good := []; for s in steps do if 1 le s and s le M then Append(~good,s); end if; end for;
+    if #good eq 0 then return SparseMatrix(GF(p),2*m*R,0,[]); end if;
+
+    entries := [];
+    for j in [1..R] do
+        base := (j-1)*(2*m);
+        for t in [1..#good] do
+            s := good[t];
+            for i in [0..n-1] do
+                c := StepBlockEncode(s,i,n); // 0..m-1
+                col := (t-1)*n + (i+1);
+                Append(~entries, < base + (2*c + 1), col, GF(p)!1 >); // OUT
+                Append(~entries, < base + (2*c + 2), col, GF(p)!1 >); // IN
+            end for;
+        end for;
+    end for;
+    return SparseMatrix(GF(p), 2*m*R, (#good)*n, entries);
+end function;
+
+//////////////////////////
+// Tests whether averaged solutions are colorless
+//////////////////////////
+procedure TestColorlessAveragedSolutions(p,n : subgroup:="DnZ2")
+    print Sprintf("Testing whether averaged solutions are automatically colorless for (p,n)=(%o,%o).",p,n);
+    print Sprintf("  subgroup = %o",subgroup);
+
+    Gp := BuildStarReductionMatrixFromCycles(p,n);
+    cvs := KernelColorVectors(n,p : Gp:=Gp);
+
+    t := Cputime();
+    A, reps, _ := BuildSymBoundaryMatrix_FromColorVectors(p,n,cvs : subgroup:=subgroup);
+    secs := Cputime(t);
+
+    M := (n-1) div 2; m := M*n; R := #reps; B := #cvs;
+    print Sprintf("Built A of size %o x %o over GF(%o) in %.3o seconds.",Nrows(A),Ncols(A),p,secs);
+    print Sprintf("  #FD vertices R = %o,  #color conditions = %o,  m = %o",R,B,m);
+
+    t_rank := Cputime();
+    r_base := Rank(A);
+    print Sprintf("The rank of the symmetrized matrix is %o. (%.3os)", r_base, Cputime(t_rank));
+
+    // Subgroup size for scaling augmentation columns
+    Hsize := SubgroupSize(subgroup,n);
+    scale := GF(p)! (Hsize mod p);
+
+    transitive := (subgroup eq "Cn") or (subgroup eq "Dn") or (subgroup eq "CnZ2") or (subgroup eq "DnZ2");
+    Aaug := A; r_prev := r_base;
+
+    for k in [1..M] do
+        if transitive then
+            Ck := ColorProfileColumnsSteps_TwoRow(p,n,reps,[k]);
+        else
+            Ck := ColorProfileColumnsSteps_TwoRow_ByColor(p,n,reps,[k]);
+        end if;
+        Ck := scale * Ck;
+
+        Aaug := HorizontalJoin(Aaug, Ck);
+
+        t_rank := Cputime();
+        r_now := Rank(Aaug);
+        secs_rank := Cputime(t_rank);
+
+        print Sprintf("After adding colorless constraints for steps 1..%o: rank = %o (%.3os)", k, r_now, secs_rank);
+        print Sprintf("   delta this addition = %o", r_now - r_prev);
+        print Sprintf("   delta cumulative    = %o", r_now - r_base);
+
+        r_prev := r_now;
+    end for;
+end procedure;
+
+TestColorlessAveragedSolutions(3,5 : subgroup:="DnZ2");
+print "";
